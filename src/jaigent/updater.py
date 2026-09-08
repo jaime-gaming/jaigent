@@ -662,6 +662,18 @@ VERIFY_TIMEOUT = 15.0
 MAX_PATH_COPIES = 5
 
 
+def same_path(left: str | None, right: str | None) -> bool:
+    """Whether two path strings name the same file.
+
+    Case-folded, because Windows and macOS both resolve paths in a case the
+    caller did not necessarily write, and a comparison that misses would list
+    the copy just upgraded as "another copy on PATH".
+    """
+    if not left or not right:
+        return False
+    return os.path.normcase(left) == os.path.normcase(right)
+
+
 def candidate_paths() -> list[Path]:
     """Every ``jaigent`` on PATH, in the order the shell would find them."""
     names = [SCRIPT_NAMES[0]]
@@ -770,7 +782,7 @@ class Verification:
         """
         if not self.resolved_path or not self.installed_path:
             return None
-        return self.resolved_path == self.installed_path
+        return same_path(self.resolved_path, self.installed_path)
 
     @property
     def elsewhere(self) -> bool:
@@ -817,8 +829,12 @@ class Verification:
 
     def other_lines(self) -> list[str]:
         """The other copies on PATH, which is the usual reason for a stale one."""
-        own = str(Path(self.resolved).resolve()) if self.resolved else ""
-        return [line for line in self.others if not own or not line.startswith(f"{own} ")]
+        own = os.path.normcase(self.resolved or "")
+        return [
+            line
+            for line in self.others
+            if not own or not os.path.normcase(line).startswith(f"{own} ")
+        ]
 
 
 def verify_update(install: Install, *, expected: str) -> Verification:
@@ -855,9 +871,9 @@ def verify_update(install: Install, *, expected: str) -> Verification:
         # The copy a module command loads has no path of its own, but the
         # script the same package installed does: comparing against it keeps
         # the upgraded copy out of the "also on PATH" list.
-        known = {verification.resolved_path, verification.installed_path}
+        known = [verification.resolved_path, verification.installed_path, which]
         if verification.installed_path is None and command:
-            known.add(str(Path(command[-1])))
+            known.append(str(Path(command[-1])))
 
         others: list[str] = []
         for path in candidate_paths()[:MAX_PATH_COPIES]:
@@ -865,7 +881,7 @@ def verify_update(install: Install, *, expected: str) -> Verification:
                 real = str(path.resolve())
             except OSError:
                 real = str(path)
-            if real in known or str(path) in known:
+            if any(same_path(real, item) or same_path(str(path), item) for item in known):
                 continue
             found = version_of([str(path)])
             others.append(f"{path} ({found or 'no version'})")

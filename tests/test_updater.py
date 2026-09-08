@@ -692,6 +692,9 @@ def test_an_older_copy_on_the_path_is_named(
     fresh = stub(new_dir, "jaigent 0.5.3")
     monkeypatch.setenv("PATH", f"{old_dir}{os.pathsep}{new_dir}")
     monkeypatch.setattr(updater, "__version__", "0.5.2")
+    # Patch the lookup rather than relying on PATH: Windows resolves to a case
+    # the test did not write, so a table keyed on `str(path)` would miss.
+    monkeypatch.setattr(updater.shutil, "which", lambda name: str(stale))
     fresh_command = " ".join([sys.executable, str(fresh)])
     fake_versions(monkeypatch, {str(stale): "0.5.2", fresh_command: "0.5.3", str(fresh): "0.5.3"})
     # The upgrade replaced the copy in new_dir; the shell starts the other one.
