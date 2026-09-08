@@ -274,17 +274,19 @@ class TestUpdateCommand:
         from jaigent.updater import Verification
 
         self._newer_release(monkeypatch)
-        # The copy the shell runs still reports the version we started from,
-        # and it is not the file the upgrade replaced: that is shadowing.
+        # The upgrade landed in one copy and the shell starts another, which
+        # still reports the version we began with: that is shadowing.
         monkeypatch.setattr(
             "jaigent.updater.verify_update",
             lambda install, *, expected: Verification(
-                command=["python", "-m", "jaigent"],
-                reported=__version__,
+                command=["/opt/venv/bin/jaigent"],
+                reported=expected,
                 expected=expected,
                 before=__version__,
                 resolved="/usr/local/bin/jaigent",
+                resolved_version=__version__,
                 resolved_path="/usr/local/bin/jaigent",
+                installed_path="/opt/venv/bin/jaigent",
                 others=("/home/me/.local/bin/jaigent (99.0.0)",),
             ),
         )
@@ -293,9 +295,36 @@ class TestUpdateCommand:
         err = capsys.readouterr().err
 
         assert code == 1
-        assert "an older copy this update did not touch" in err
+        assert "99.0.0 is installed, but in a copy it does not start" in err
         assert "Remove /usr/local/bin/jaigent" in err
         assert "/home/me/.local/bin/jaigent (99.0.0)" in err
+
+    def test_a_stale_copy_is_named_when_nothing_was_installed(
+        self, home: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+    ) -> None:
+        from jaigent import __version__
+        from jaigent.updater import Verification
+
+        self._newer_release(monkeypatch)
+        monkeypatch.setattr(
+            "jaigent.updater.verify_update",
+            lambda install, *, expected: Verification(
+                command=["/opt/venv/bin/jaigent"],
+                reported=__version__,
+                expected=expected,
+                before=__version__,
+                resolved="/usr/local/bin/jaigent",
+                resolved_version=__version__,
+                resolved_path="/usr/local/bin/jaigent",
+                installed_path="/opt/venv/bin/jaigent",
+            ),
+        )
+
+        code = cli.main(["update", "--no-color", "--yes"])
+        err = capsys.readouterr().err
+
+        assert code == 1
+        assert "an older copy this update did not touch" in err
 
     def test_a_pip_install_is_told_about_the_git_fallback(
         self, home: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture

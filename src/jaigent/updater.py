@@ -722,29 +722,34 @@ def run_command(install: Install) -> list[str]:
 
 @dataclass(slots=True)
 class Verification:
-    """What actually answers to ``jaigent`` after an upgrade.
+    """What answers to ``jaigent`` after an upgrade.
 
     Every upgrade command exits 0 in situations that changed nothing — pip
     finding no newer version on the index, a git checkout that is already at
     the remote commit, a package that is not on PyPI at all and therefore
     silently falling back to a git install. Reporting success on the exit code
-    alone is how "it says updated but nothing changed" happens, so the update
-    command asks the installed CLI what it is before it says anything.
+    alone is how "it says updated but nothing changed" happens.
+
+    Two separate questions are answered, because they fail independently:
+    did the copy we replaced actually change, and is that copy the one the
+    shell will start.
     """
 
-    #: The copy of the CLI that was asked, as a command list.
+    #: The copy that was replaced, as a command list.
     command: list[str] = field(default_factory=list)
-    #: What that copy reports, if it answered.
+    #: What the replaced copy reports, if it answered.
     reported: str | None = None
     #: What it should report after a successful upgrade.
     expected: str = ""
     #: What the running process was, before the upgrade.
     before: str = ""
-    #: Where the CLI was resolved from, when it was found on PATH.
+    #: The ``jaigent`` the shell would start, and what it reports.
     resolved: str | None = None
-    #: The resolved copy's real path, so it can be compared with what we
-    #: upgraded. ``None`` when nothing on PATH answers to ``jaigent``.
+    resolved_version: str | None = None
     resolved_path: str | None = None
+    #: The replaced copy's real path, when it was started as a file. A
+    #: ``python -m jaigent`` command names a module, so there is no path.
+    installed_path: str | None = None
     #: Other copies on PATH, as ``"path (version)"``.
     others: tuple[str, ...] = ()
     #: Why nothing could be determined, if that is what happened.
@@ -752,34 +757,63 @@ class Verification:
 
     @property
     def updated(self) -> bool:
-        """The installed copy reports the version we were aiming at."""
+        """The copy we replaced now reports the version we were aiming at."""
         return self.reported is not None and self.reported == self.expected
 
     @property
+    def same_copy(self) -> bool | None:
+        """Whether the shell starts the file we replaced, or ``None`` if unknown.
+
+        Unknown is the interesting case: a pip install is upgraded in place and
+        reached as ``python -m jaigent``, so there is no path to compare with
+        the one the shell resolved.
+        """
+        if not self.resolved_path or not self.installed_path:
+            return None
+        return self.resolved_path == self.installed_path
+
+    @property
     def elsewhere(self) -> bool:
-        """The shell would run a different file from the one we replaced."""
-        if not self.resolved_path or not self.command:
-            return False
-        return self.resolved_path != str(Path(self.command[0]).resolve())
+        """The shell provably starts a different file from the one replaced."""
+        return self.same_copy is False
 
     @property
     def shadowed(self) -> bool:
-        """An old copy earlier on PATH is what the shell will run.
+        """A stale copy earlier on PATH is what the shell will run.
 
         This is the "it says updated but nothing changed" case: the upgrade
-        replaced one copy and the terminal keeps starting another, so the
-        version the user sees never moves. Reinstalling the very copy the
-        shell runs is not shadowing — it legitimately reports the old version
-        until the new one is in place, which is what ``updated`` is for.
+        landed in one copy and the terminal keeps starting another, so the
+        version the user sees never moves.
         """
-        return self.reported is not None and self.reported == self.before and self.elsewhere
+        if self.updated:
+            # The copy we replaced is right, so the only way the user still
+            # sees the old version is a different copy earlier on PATH. A
+            # module command cannot be compared by path, so the version that
+            # copy reports is the evidence instead.
+            return self.resolved_version is not None and self.resolved_version != self.expected
+        if self.reported != self.before or self.resolved_version is None:
+            return False
+        # Nothing was installed. The user keeps seeing the old version if the
+        # copy on PATH reports something other than the one we just asked —
+        # or if it reports the same thing and is provably a different file.
+        return self.resolved_version != self.reported or self.same_copy is False
+
+    @property
+    def own_location(self) -> str:
+        """The replaced copy as a path, or "" when it was reached as a module."""
+        return self.installed_path or ""
 
     def line(self) -> str:
-        """A one-line account of the installed copy."""
+        """A one-line account of the copy that was replaced."""
         where = self.resolved or " ".join(self.command) or "?"
         if self.reported is None:
             return where
         return f"{self.reported} ({where})"
+
+    def shell_line(self) -> str:
+        """A one-line account of the copy the shell will start."""
+        version = self.resolved_version or "no version"
+        return f"{version} ({self.resolved})"
 
     def other_lines(self) -> list[str]:
         """The other copies on PATH, which is the usual reason for a stale one."""
@@ -800,6 +834,12 @@ def verify_update(install: Install, *, expected: str) -> Verification:
             with contextlib.suppress(OSError):
                 verification.resolved_path = str(Path(which).resolve())
 
+        # Only a command that starts a file has a path to compare with the one
+        # the shell resolves; `python -m jaigent` names a module instead.
+        if len(command) == 1:
+            with contextlib.suppress(OSError):
+                verification.installed_path = str(Path(command[0]).resolve())
+
         verification.reported = version_of(command)
         if verification.reported is None:
             verification.error = (
@@ -807,14 +847,26 @@ def verify_update(install: Install, *, expected: str) -> Verification:
                 "The upgrade may still have worked."
             )
 
-        own = Path(which).resolve() if which else None
+        # What the shell will actually start, which is not necessarily the
+        # copy that was just replaced.
+        if which:
+            verification.resolved_version = version_of([which])
+
+        # The copy a module command loads has no path of its own, but the
+        # script the same package installed does: comparing against it keeps
+        # the upgraded copy out of the "also on PATH" list.
+        known = {verification.resolved_path, verification.installed_path}
+        if verification.installed_path is None and command:
+            known.add(str(Path(command[-1])))
+
         others: list[str] = []
         for path in candidate_paths()[:MAX_PATH_COPIES]:
             try:
-                if own is not None and path.resolve() == own:
-                    continue
+                real = str(path.resolve())
             except OSError:
-                pass
+                real = str(path)
+            if real in known or str(path) in known:
+                continue
             found = version_of([str(path)])
             others.append(f"{path} ({found or 'no version'})")
         verification.others = tuple(others)

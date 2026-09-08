@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -546,11 +547,46 @@ def test_pip_update_fallback_to_git_url(monkeypatch: pytest.MonkeyPatch) -> None
 # ------------------------------------------------- proving the update worked
 
 
-def stub(path: Path, text: str) -> Path:
-    """A fake `jaigent` that prints `text` for --version."""
-    path.write_text(f'#!/bin/sh\necho "{text}"\n', encoding="utf-8")
+def script(body: str) -> str:
+    """A fake `jaigent`, as Python source: it runs on every platform.
+
+    A `#!/bin/sh` stub cannot be executed by subprocess on Windows, which is
+    how the first version of these tests went red on the windows-latest runner.
+    """
+    import textwrap
+
+    return textwrap.dedent(body)
+
+
+def stub(directory: Path, text: str, *, name: str = "jaigent") -> Path:
+    """Write a fake `jaigent` where a PATH lookup will find it.
+
+    Windows only resolves names listed in PATHEXT, so the file is `jaigent.bat`
+    there and plain `jaigent` elsewhere.
+    """
+    path = directory / f"{name}.bat" if os.name == "nt" else directory / name
+    path.write_text(script(f'\nprint("{text}")\n'), encoding="utf-8")
     path.chmod(0o755)
     return path
+
+
+def invoke(path: Path) -> list[str]:
+    """How to start the stub. A .bat runs itself; anything else needs Python."""
+    return [str(path)] if os.name == "nt" else [sys.executable, str(path)]
+
+
+def fake_versions(monkeypatch: pytest.MonkeyPatch, table: dict[str, str | None]) -> None:
+    """Answer `--version` from a table instead of starting a process.
+
+    The classification below is what is under test, and starting real binaries
+    to exercise it would make every case depend on the platform's idea of an
+    executable. `version_of` itself is tested separately, for real.
+    """
+
+    def version_of(command: list[str]) -> str | None:
+        return table.get(" ".join(command))
+
+    monkeypatch.setattr(updater, "version_of", version_of)
 
 
 def test_the_version_is_the_last_field_of_the_version_line() -> None:
@@ -560,41 +596,72 @@ def test_the_version_is_the_last_field_of_the_version_line() -> None:
 
 
 def test_version_of_reads_a_real_process(tmp_path: Path) -> None:
-    binary = stub(tmp_path / "jaigent", "jaigent 0.5.3")
+    binary = stub(tmp_path, "jaigent 0.5.3")
 
-    assert updater.version_of([str(binary)]) == "0.5.3"
+    assert updater.version_of(invoke(binary)) == "0.5.3"
 
 
 def test_version_of_a_broken_binary_is_none(tmp_path: Path) -> None:
-    broken = tmp_path / "jaigent"
-    broken.write_text("#!/bin/sh\nexit 3\n", encoding="utf-8")
-    broken.chmod(0o755)
+    broken = tmp_path / "broken.py"
+    broken.write_text(script("\nraise SystemExit(3)\n"), encoding="utf-8")
 
-    assert updater.version_of([str(broken)]) is None
+    assert updater.version_of(invoke(broken)) is None
 
 
-def test_every_copy_on_the_path_is_found_in_order(tmp_path: Path, monkeypatch) -> None:  # noqa: ANN001
+def test_every_copy_on_the_path_is_found_in_order(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     first = tmp_path / "old"
     second = tmp_path / "new"
     first.mkdir()
     second.mkdir()
-    stub(first / "jaigent", "jaigent 0.5.2")
-    stub(second / "jaigent", "jaigent 0.5.3")
+    stub(first, "jaigent 0.5.2")
+    stub(second, "jaigent 0.5.3")
     monkeypatch.setenv("PATH", f"{first}{os.pathsep}{second}")
 
-    assert [p.parent.name for p in updater.candidate_paths()] == ["old", "new"]
+    assert [path.parent.name for path in updater.candidate_paths()] == ["old", "new"]
 
 
-def test_an_install_that_took_effect_is_reported_as_updated(tmp_path: Path, monkeypatch) -> None:  # noqa: ANN001
-    binary = stub(tmp_path / "jaigent", f"jaigent {__version__}")
+def test_an_install_that_took_effect_is_reported_as_updated(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    binary = stub(tmp_path, f"jaigent {__version__}")
     monkeypatch.setenv("PATH", str(tmp_path))
-    install = Install(kind="binary", location=str(binary))
+    fake_versions(monkeypatch, {str(binary): __version__})
+    monkeypatch.setattr(updater, "run_command", lambda install: [str(binary)])
 
-    check = updater.verify_update(install, expected=__version__)
+    check = updater.verify_update(
+        Install(kind="binary", location=str(binary)), expected=__version__
+    )
 
     assert check.updated is True
+    assert check.same_copy is True
+    assert check.elsewhere is False
     assert check.shadowed is False
     assert check.reported == __version__
+
+
+def test_reinstalling_the_copy_the_shell_runs_is_not_shadowing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A binary install replaces exactly the file the shell starts.
+
+    The reported version equals the one from before the upgrade, which only
+    reads as shadowing when a *different* file answers to `jaigent`.
+    """
+    binary = stub(tmp_path, "jaigent 0.5.3")
+    monkeypatch.setattr(updater, "__version__", "0.5.2")
+    fake_versions(monkeypatch, {str(binary): "0.5.3"})
+    monkeypatch.setattr(updater.shutil, "which", lambda name: str(binary))
+    monkeypatch.setattr(updater, "candidate_paths", lambda: [binary])
+    monkeypatch.setattr(updater, "run_command", lambda install: [str(binary)])
+
+    check = updater.verify_update(Install(kind="binary", location=str(binary)), expected="0.5.3")
+
+    assert check.updated is True
+    assert check.same_copy is True
+    assert check.elsewhere is False
+    assert check.shadowed is False
 
 
 def test_an_older_copy_on_the_path_is_named(
@@ -602,7 +669,7 @@ def test_an_older_copy_on_the_path_is_named(
 ) -> None:
     """The real "it says updated but nothing changed": two installs, one stale.
 
-    A pip install is what makes this possible: the copy that was upgraded is
+    A pip install is what makes it possible — the copy that was upgraded is
     reached through the interpreter, while the shell keeps starting a binary
     from somewhere else on PATH.
     """
@@ -610,46 +677,74 @@ def test_an_older_copy_on_the_path_is_named(
     new_dir = tmp_path / "new"
     old_dir.mkdir()
     new_dir.mkdir()
-    # The stale binary reports what this process is running, which is exactly
-    # the situation the update command has to recognise.
-    stale = stub(old_dir / "jaigent", f"jaigent {__version__}")
-    fresh = stub(new_dir / "jaigent", "jaigent 99.0.0")
+    stale = stub(old_dir, "jaigent 0.5.2")
+    fresh = stub(new_dir, "jaigent 0.5.3")
     monkeypatch.setenv("PATH", f"{old_dir}{os.pathsep}{new_dir}")
+    monkeypatch.setattr(updater, "__version__", "0.5.2")
+    fresh_command = " ".join([sys.executable, str(fresh)])
+    fake_versions(monkeypatch, {str(stale): "0.5.2", fresh_command: "0.5.3", str(fresh): "0.5.3"})
+    # The upgrade replaced the copy in new_dir; the shell starts the other one.
+    monkeypatch.setattr(updater, "run_command", lambda install: [sys.executable, str(fresh)])
 
-    install = Install(kind="pip", location=str(new_dir))
-    check = updater.verify_update(install, expected="99.0.0")
+    check = updater.verify_update(Install(kind="pip", location=str(new_dir)), expected="0.5.3")
+
+    assert check.reported == "0.5.3", "the upgraded copy did move"
+    assert check.updated is True
+    assert check.same_copy is None, "a module command has no path to compare"
+    assert check.elsewhere is False, "so nothing is provable by path"
+    assert check.shadowed is True, "but the copy on PATH still reports 0.5.2"
+    assert check.resolved == str(stale)
+    assert "0.5.2" in check.shell_line()
+    assert not check.other_lines(), "both copies are already accounted for"
+
+
+def test_a_pip_run_with_nothing_newer_on_the_index(tmp_path: Path, monkeypatch) -> None:  # noqa: ANN001
+    """pip exits 0 and installs nothing when the index has no newer version."""
+    installed = stub(tmp_path, f"jaigent {__version__}")
+    monkeypatch.setenv("PATH", str(tmp_path))
+    module_command = f"{sys.executable} -m jaigent"
+    fake_versions(monkeypatch, {str(installed): __version__, module_command: __version__})
+    monkeypatch.setattr(updater.shutil, "which", lambda name: str(installed))
+    monkeypatch.setattr(updater, "run_command", lambda install: [sys.executable, "-m", "jaigent"])
+
+    check = updater.verify_update(Install(kind="pip", location="/x"), expected="0.6.0")
 
     assert check.updated is False
-    assert check.elsewhere is True, "PATH resolves somewhere other than the install"
-    assert check.shadowed is True, "and that copy reports exactly what we had before"
-    assert check.resolved == str(stale)
-    assert any(str(fresh) in line for line in check.other_lines())
-    # The copy that was asked must not also be listed as "another" copy.
-    assert not any(str(stale) in line for line in check.other_lines())
+    assert check.same_copy is None, "a module command has no path to compare"
+    assert check.elsewhere is False, "so nothing is provable by path"
+    assert check.shadowed is False, "and the copy on PATH reports the same version"
+    assert check.own_location == "", "a module command has no path to name"
+    assert check.error == ""
 
 
-def test_reinstalling_the_copy_the_shell_runs_is_not_shadowing(
+def test_an_upgrade_that_landed_but_a_stale_copy_the_shell_starts(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A binary install replaces exactly the file the shell starts."""
-    binary = stub(tmp_path / "jaigent", f"jaigent {__version__}")
-    monkeypatch.setenv("PATH", str(tmp_path))
-    monkeypatch.setattr(updater, "__version__", "0.5.2")
+    """The update worked; the terminal will still start the old one."""
+    stale = stub(tmp_path, "jaigent 0.5.2")
+    fresh = stub(tmp_path, "jaigent 0.5.3", name="jaigent-new")
+    fake_versions(monkeypatch, {str(stale): "0.5.2", str(fresh): "0.5.3"})
+    monkeypatch.setattr(updater.shutil, "which", lambda name: str(stale))
+    monkeypatch.setattr(updater, "candidate_paths", lambda: [stale, fresh])
+    monkeypatch.setattr(updater, "run_command", lambda install: [str(fresh)])
 
-    check = updater.verify_update(Install(kind="binary", location=str(binary)), expected="0.5.3")
+    check = updater.verify_update(Install(kind="binary", location=str(fresh)), expected="0.5.3")
 
     assert check.updated is True
-    assert check.elsewhere is False
-    assert check.shadowed is False
+    assert check.same_copy is False
+    assert check.elsewhere is True
+    assert check.shadowed is True
+    assert "0.5.2" in check.shell_line()
+    assert check.other_lines() == [], "both copies are already accounted for"
 
 
 def test_a_copy_that_reports_nothing_is_an_error_not_a_success(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    broken = tmp_path / "jaigent"
-    broken.write_text("#!/bin/sh\nexit 3\n", encoding="utf-8")
-    broken.chmod(0o755)
+    broken = stub(tmp_path, "")
     monkeypatch.setenv("PATH", str(tmp_path))
+    fake_versions(monkeypatch, {str(broken): None})
+    monkeypatch.setattr(updater, "run_command", lambda install: [str(broken)])
 
     check = updater.verify_update(Install(kind="binary", location=str(broken)), expected="0.5.3")
 
