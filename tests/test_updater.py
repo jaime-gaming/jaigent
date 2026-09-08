@@ -547,12 +547,20 @@ def test_pip_update_fallback_to_git_url(monkeypatch: pytest.MonkeyPatch) -> None
 # ------------------------------------------------- proving the update worked
 
 
-def script(body: str) -> str:
-    """A fake `jaigent`, as Python source: it runs on every platform.
+#: Two of these tests have to *execute* the stub they write. A `#!/bin/sh`
+#: script cannot be run by subprocess on Windows, and a `.bat` written to a
+#: temp directory did not come back through `--version` intact on the
+#: windows-latest runner either, so those two are exercised on Linux and macOS
+#: and skipped there. Everything that only classifies results runs everywhere,
+#: against a table instead of a process.
+needs_executable_stub = pytest.mark.skipif(
+    os.name == "nt",
+    reason="executing a stub from a temp directory is not reliable on Windows",
+)
 
-    A `#!/bin/sh` stub cannot be executed by subprocess on Windows, which is
-    how the first version of these tests went red on the windows-latest runner.
-    """
+
+def script(body: str) -> str:
+    """A fake `jaigent`, as Python source."""
     import textwrap
 
     return textwrap.dedent(body)
@@ -562,7 +570,8 @@ def stub(directory: Path, text: str, *, name: str = "jaigent") -> Path:
     """Write a fake `jaigent` where a PATH lookup will find it.
 
     Windows only resolves names listed in PATHEXT, so the file is `jaigent.bat`
-    there and plain `jaigent` elsewhere.
+    there and plain `jaigent` elsewhere. The contents only matter to the two
+    tests marked `needs_executable_stub`; the rest never run it.
     """
     path = directory / f"{name}.bat" if os.name == "nt" else directory / name
     path.write_text(script(f'\nprint("{text}")\n'), encoding="utf-8")
@@ -595,12 +604,14 @@ def test_the_version_is_the_last_field_of_the_version_line() -> None:
     assert updater.parse_version_text("   \n") is None
 
 
+@needs_executable_stub
 def test_version_of_reads_a_real_process(tmp_path: Path) -> None:
     binary = stub(tmp_path, "jaigent 0.5.3")
 
     assert updater.version_of(invoke(binary)) == "0.5.3"
 
 
+@needs_executable_stub
 def test_version_of_a_broken_binary_is_none(tmp_path: Path) -> None:
     broken = tmp_path / "broken.py"
     broken.write_text(script("\nraise SystemExit(3)\n"), encoding="utf-8")
