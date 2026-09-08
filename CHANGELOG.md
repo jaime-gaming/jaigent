@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`jaigent update` no longer reports success it has not earned.** The
+  upgrade command's exit code was the whole verdict, so "Already up to date"
+  on a source checkout, a pip run with nothing newer on the index, and a
+  stale binary first on `PATH` all printed *Updated successfully*. The
+  installed CLI is now asked its version after the upgrade and compared with
+  the one before; anything else exits 1 and names the cause, listing every
+  other `jaigent` on `PATH` with its version.
+- **A source checkout on a feature branch is refused** instead of quietly
+  pulling that branch and calling it an update.
+- **`pipx upgrade` has a fallback.** pipx refuses to upgrade an app that did
+  not come from a registry; it is now reinstalled with
+  `pipx install --force`, from PyPI and then from git.
+- **The PyPI publish job states its own outcome.** v0.5.3 failed the
+  trusted-publishing exchange (`invalid-publisher`: the PyPI project did not
+  match the `environment:pypi` claim the job presents) and nothing said what
+  to change. The job now prefers a `PYPI_API_TOKEN` secret when one is set,
+  pins `pypa/gh-action-pypi-publish` to a commit, keeps `skip-existing: false`
+  so a duplicate version fails loudly, and ends by asking
+  `pypi.org/pypi/jaigent/<version>/json` whether the version actually landed.
+  A failure writes the exact publisher settings to the job summary, and
+  re-running the failed job republishes the tag without rebuilding anything.
+  See `.github/README.md`.
+
 ## [0.5.3] - 2026-09-08
 
 The public 0.5.3 cut: orange jAI chrome, every saved chat, `jaigent auth`,

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import time
 from pathlib import Path
@@ -540,3 +541,197 @@ def test_pip_update_fallback_to_git_url(monkeypatch: pytest.MonkeyPatch) -> None
     assert "from git" in output
     assert len(seen) == 2
     assert "git+https://github.com/jaime-gaming/jaigent.git" in seen[1][-1]
+
+
+# ------------------------------------------------- proving the update worked
+
+
+def stub(path: Path, text: str) -> Path:
+    """A fake `jaigent` that prints `text` for --version."""
+    path.write_text(f'#!/bin/sh\necho "{text}"\n', encoding="utf-8")
+    path.chmod(0o755)
+    return path
+
+
+def test_the_version_is_the_last_field_of_the_version_line() -> None:
+    assert updater.parse_version_text("jaigent 0.5.3\n") == "0.5.3"
+    assert updater.parse_version_text("") is None
+    assert updater.parse_version_text("   \n") is None
+
+
+def test_version_of_reads_a_real_process(tmp_path: Path) -> None:
+    binary = stub(tmp_path / "jaigent", "jaigent 0.5.3")
+
+    assert updater.version_of([str(binary)]) == "0.5.3"
+
+
+def test_version_of_a_broken_binary_is_none(tmp_path: Path) -> None:
+    broken = tmp_path / "jaigent"
+    broken.write_text("#!/bin/sh\nexit 3\n", encoding="utf-8")
+    broken.chmod(0o755)
+
+    assert updater.version_of([str(broken)]) is None
+
+
+def test_every_copy_on_the_path_is_found_in_order(tmp_path: Path, monkeypatch) -> None:  # noqa: ANN001
+    first = tmp_path / "old"
+    second = tmp_path / "new"
+    first.mkdir()
+    second.mkdir()
+    stub(first / "jaigent", "jaigent 0.5.2")
+    stub(second / "jaigent", "jaigent 0.5.3")
+    monkeypatch.setenv("PATH", f"{first}{os.pathsep}{second}")
+
+    assert [p.parent.name for p in updater.candidate_paths()] == ["old", "new"]
+
+
+def test_an_install_that_took_effect_is_reported_as_updated(tmp_path: Path, monkeypatch) -> None:  # noqa: ANN001
+    binary = stub(tmp_path / "jaigent", f"jaigent {__version__}")
+    monkeypatch.setenv("PATH", str(tmp_path))
+    install = Install(kind="binary", location=str(binary))
+
+    check = updater.verify_update(install, expected=__version__)
+
+    assert check.updated is True
+    assert check.shadowed is False
+    assert check.reported == __version__
+
+
+def test_an_older_copy_on_the_path_is_named(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The real "it says updated but nothing changed": two installs, one stale.
+
+    A pip install is what makes this possible: the copy that was upgraded is
+    reached through the interpreter, while the shell keeps starting a binary
+    from somewhere else on PATH.
+    """
+    old_dir = tmp_path / "old"
+    new_dir = tmp_path / "new"
+    old_dir.mkdir()
+    new_dir.mkdir()
+    # The stale binary reports what this process is running, which is exactly
+    # the situation the update command has to recognise.
+    stale = stub(old_dir / "jaigent", f"jaigent {__version__}")
+    fresh = stub(new_dir / "jaigent", "jaigent 99.0.0")
+    monkeypatch.setenv("PATH", f"{old_dir}{os.pathsep}{new_dir}")
+
+    install = Install(kind="pip", location=str(new_dir))
+    check = updater.verify_update(install, expected="99.0.0")
+
+    assert check.updated is False
+    assert check.elsewhere is True, "PATH resolves somewhere other than the install"
+    assert check.shadowed is True, "and that copy reports exactly what we had before"
+    assert check.resolved == str(stale)
+    assert any(str(fresh) in line for line in check.other_lines())
+    # The copy that was asked must not also be listed as "another" copy.
+    assert not any(str(stale) in line for line in check.other_lines())
+
+
+def test_reinstalling_the_copy_the_shell_runs_is_not_shadowing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A binary install replaces exactly the file the shell starts."""
+    binary = stub(tmp_path / "jaigent", f"jaigent {__version__}")
+    monkeypatch.setenv("PATH", str(tmp_path))
+    monkeypatch.setattr(updater, "__version__", "0.5.2")
+
+    check = updater.verify_update(Install(kind="binary", location=str(binary)), expected="0.5.3")
+
+    assert check.updated is True
+    assert check.elsewhere is False
+    assert check.shadowed is False
+
+
+def test_a_copy_that_reports_nothing_is_an_error_not_a_success(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    broken = tmp_path / "jaigent"
+    broken.write_text("#!/bin/sh\nexit 3\n", encoding="utf-8")
+    broken.chmod(0o755)
+    monkeypatch.setenv("PATH", str(tmp_path))
+
+    check = updater.verify_update(Install(kind="binary", location=str(broken)), expected="0.5.3")
+
+    assert check.updated is False
+    assert check.shadowed is False
+    assert check.error
+
+
+def test_a_pip_install_is_asked_through_this_interpreter() -> None:
+    command = updater.run_command(Install(kind="pip", location="x"))
+
+    assert command == [updater.sys.executable, "-m", "jaigent"]
+
+
+# --------------------------------------------------------------- pipx, source
+
+
+def test_pipx_falls_back_to_a_forced_reinstall(monkeypatch: pytest.MonkeyPatch) -> None:
+    seen: list[list[str]] = []
+
+    def fake_run(command: list[str], timeout: float = 600.0) -> subprocess.CompletedProcess[str]:
+        seen.append(command)
+        # `pipx upgrade` refuses an app that did not come from a registry.
+        if command[:2] == ["pipx", "upgrade"]:
+            return subprocess.CompletedProcess(command, 1, "", "not installed from a registry")
+        return subprocess.CompletedProcess(command, 0, "installed", "")
+
+    monkeypatch.setattr(updater, "_run", fake_run)
+
+    updater.perform_update(Install(kind="pipx", location="x"))
+
+    assert seen[1] == ["pipx", "install", "--force", "jaigent"]
+
+
+def test_pipx_falls_back_to_git_when_the_package_is_not_on_pypi(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen: list[list[str]] = []
+
+    def fake_run(command: list[str], timeout: float = 600.0) -> subprocess.CompletedProcess[str]:
+        seen.append(command)
+        if command[:2] == ["pipx", "upgrade"] or command[-1] == "jaigent":
+            return subprocess.CompletedProcess(command, 1, "", "No package found")
+        return subprocess.CompletedProcess(command, 0, "installed from git", "")
+
+    monkeypatch.setattr(updater, "_run", fake_run)
+
+    output = updater.perform_update(Install(kind="pipx", location="x"))
+
+    assert "from git" in output
+    assert seen[-1] == ["pipx", "install", "--force", f"git+{updater.REPO_URL}.git"]
+
+
+def test_a_source_checkout_on_a_feature_branch_is_refused(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """`git pull --ff-only` exits 0 there and updates nothing."""
+    monkeypatch.setattr(updater, "find_source_root", lambda start=None: tmp_path)
+    monkeypatch.setattr(updater, "_git", lambda *a, **k: "arena/some-session")
+    monkeypatch.setattr(
+        updater,
+        "_run",
+        lambda *a, **k: pytest.fail("nothing should be run on the wrong branch"),
+    )
+
+    with pytest.raises(UpdateError, match="arena/some-session"):
+        updater.perform_update(Install(kind="source", location=str(tmp_path)))
+
+
+def test_a_source_checkout_on_main_is_updated(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(updater, "find_source_root", lambda start=None: tmp_path)
+    monkeypatch.setattr(updater, "_git", lambda *a, **k: "main")
+    monkeypatch.setattr(
+        updater,
+        "_run",
+        lambda command, timeout=600.0: subprocess.CompletedProcess(
+            command, 0, "Already up to date", ""
+        ),
+    )
+
+    assert "Already up to date" in updater.perform_update(
+        Install(kind="source", location=str(tmp_path))
+    )
