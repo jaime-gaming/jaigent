@@ -893,13 +893,19 @@ def test_the_bin_dir_override_does_not_leak_into_the_environment(
     assert "JAIGENT_BIN_DIR" not in os.environ
 
 
-def test_a_frozen_binary_records_its_directory(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_a_frozen_binary_records_its_directory(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # Under tmp_path rather than a literal "/opt/...": Path.resolve() turns the
+    # latter into "D:\opt\..." on Windows, where that assertion was simply wrong.
+    binary = tmp_path / "jaigent"
     monkeypatch.setattr(updater.sys, "frozen", True, raising=False)
-    monkeypatch.setattr(updater.sys, "executable", "/opt/jaigent/bin/jaigent", raising=False)
+    monkeypatch.setattr(updater.sys, "executable", str(binary), raising=False)
 
     install = detect_install()
 
-    assert install.bin_dir == "/opt/jaigent/bin"
+    assert install.location == str(binary.resolve())
+    assert install.bin_dir == str(binary.resolve().parent)
 
 
 def test_a_failed_editable_reinstall_is_not_reported_as_success(
