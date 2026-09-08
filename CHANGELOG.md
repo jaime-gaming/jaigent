@@ -7,7 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **`jaigent serve --no-auth --host 0.0.0.0` is refused.** Gateway requests run
+  with approvals forced to `auto`, so an unauthenticated gateway on a reachable
+  interface was remote control of the workspace, billed to your provider
+  account. `SECURITY.md` warned about the combination; `ServerConfig.validate`
+  now rejects it (exit 78) and says how to fix it. Loopback is unaffected, and
+  an authenticated server may still bind anywhere.
+- **The installers no longer install an unverified binary.** `install.sh`
+  installed anyway when neither `sha256sum` nor `shasum` existed, and
+  `install.ps1` treated *any* failure to fetch `checksums.txt` — including an
+  intercepted connection — as "no checksum published, skipping verification".
+  Both are fatal now, as is a `checksums.txt` with no entry for the asset.
+  A failed `mv`/`Copy-Item` is reported instead of leaving no binary behind an
+  "Installed" message.
+
 ### Fixed
+
+- **A binary update replaces the binary you are running.** Both installers
+  default to their own directory (`~/.local/bin`, `%LOCALAPPDATA%`), so an
+  update from anywhere else installed a second copy and left the shell running
+  the old one. `jaigent update` now passes `JAIGENT_BIN_DIR`, and the Windows
+  installer renames a locked `jaigent.exe` aside instead of failing.
+- **A failed `pip install -e .` after a source pull is an error.** The tree was
+  new and the import was old, and it printed "Updated successfully".
+- **`pipx` is run through this interpreter** when it is installed there, because
+  the `pipx` on `PATH` may belong to a different Python than the app it is
+  upgrading; it falls back to `PATH` when it is not.
 
 - **`jaigent update` no longer reports success it has not earned.** The
   upgrade command's exit code was the whole verdict, so "Already up to date"

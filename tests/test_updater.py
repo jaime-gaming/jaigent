@@ -844,3 +844,124 @@ def test_a_source_checkout_on_main_is_updated(
     assert "Already up to date" in updater.perform_update(
         Install(kind="source", location=str(tmp_path))
     )
+
+
+# ------------------------------------------- where an update actually installs
+
+
+def test_a_binary_update_replaces_the_binary_that_is_running(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Both installers default to their own directory, not to this one.
+
+    Without JAIGENT_BIN_DIR an update installs to ~/.local/bin while the shell
+    keeps running the binary it started, which is the update that reports
+    success and changes nothing.
+    """
+    seen: dict[str, str | None] = {}
+
+    def fake_run(command: list[str], timeout: float = 600.0) -> subprocess.CompletedProcess[str]:
+        seen["bin_dir"] = os.environ.get("JAIGENT_BIN_DIR")
+        return subprocess.CompletedProcess(command, 0, "ok", "")
+
+    monkeypatch.setattr(updater, "_run", fake_run)
+    monkeypatch.setattr(updater.platform, "system", lambda: "Linux")
+    install = Install(
+        kind="binary", location="/opt/jaigent/bin/jaigent", bin_dir="/opt/jaigent/bin"
+    )
+
+    updater.perform_update(install)
+
+    assert seen["bin_dir"] == "/opt/jaigent/bin"
+
+
+def test_the_bin_dir_override_does_not_leak_into_the_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("JAIGENT_BIN_DIR", raising=False)
+    monkeypatch.setattr(
+        updater,
+        "_run",
+        lambda *a, **k: subprocess.CompletedProcess([], 0, "ok", ""),
+    )
+    install = Install(
+        kind="binary", location="/opt/jaigent/bin/jaigent", bin_dir="/opt/jaigent/bin"
+    )
+
+    updater.perform_update(install)
+
+    assert "JAIGENT_BIN_DIR" not in os.environ
+
+
+def test_a_frozen_binary_records_its_directory(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(updater.sys, "frozen", True, raising=False)
+    monkeypatch.setattr(updater.sys, "executable", "/opt/jaigent/bin/jaigent", raising=False)
+
+    install = detect_install()
+
+    assert install.bin_dir == "/opt/jaigent/bin"
+
+
+def test_a_failed_editable_reinstall_is_not_reported_as_success(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """`git pull` succeeded, so the tree is new and the import is still old."""
+    monkeypatch.setattr(updater, "find_source_root", lambda start=None: tmp_path)
+    monkeypatch.setattr(updater, "_git", lambda *a, **k: "main")
+
+    def fake_run(command: list[str], timeout: float = 600.0) -> subprocess.CompletedProcess[str]:
+        if "-e" in command:
+            return subprocess.CompletedProcess(
+                command, 1, "", "error: externally-managed-environment"
+            )
+        return subprocess.CompletedProcess(command, 0, "Already up to date.", "")
+
+    monkeypatch.setattr(updater, "_run", fake_run)
+
+    with pytest.raises(UpdateError, match="externally-managed-environment"):
+        updater.perform_update(Install(kind="source", location=str(tmp_path)))
+
+
+def test_pipx_is_run_through_this_interpreter_when_it_is_installed_here(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(updater.importlib.util, "find_spec", lambda name: object())
+
+    command = upgrade_command(Install(kind="pipx", location="x"))
+
+    assert command == [updater.sys.executable, "-m", "pipx", "upgrade", "jaigent"]
+
+
+def test_pipx_falls_back_to_the_path_when_it_is_not_a_module(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(updater.importlib.util, "find_spec", lambda name: None)
+
+    assert upgrade_command(Install(kind="pipx", location="x")) == ["pipx", "upgrade", "jaigent"]
+
+
+def test_a_missing_pipx_module_falls_back_to_the_one_on_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen: list[list[str]] = []
+
+    def fake_run(command: list[str], timeout: float = 600.0) -> subprocess.CompletedProcess[str]:
+        seen.append(command)
+        return subprocess.CompletedProcess(command, 0, "ok", "")
+
+    monkeypatch.setattr(updater.importlib.util, "find_spec", lambda name: object())
+    monkeypatch.setattr(updater, "_run", fake_run)
+    original = updater._run
+
+    def failing_first(command: list[str], timeout: float = 600.0):  # noqa: ANN202
+        if not seen:
+            seen.append(command)
+            raise FileNotFoundError("No module named pipx")
+        return original(command)
+
+    monkeypatch.setattr(updater, "_run", failing_first)
+
+    updater.perform_update(Install(kind="pipx", location="x"))
+
+    assert seen[0][:2] == [updater.sys.executable, "-m"]
+    assert seen[1][0] == "pipx"

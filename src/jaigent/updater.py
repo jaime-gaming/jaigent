@@ -19,6 +19,7 @@ the PATH.
 from __future__ import annotations
 
 import contextlib
+import importlib.util
 import json
 import os
 import platform
@@ -119,6 +120,10 @@ class Install:
     kind: str
     #: Human-readable location.
     location: str
+    #: For a standalone binary, the directory it lives in. The installers read
+    #: ``JAIGENT_BIN_DIR``, so an update can be told to replace *this* binary
+    #: rather than whatever their default happens to be.
+    bin_dir: str = ""
 
     @property
     def upgradable(self) -> bool:
@@ -142,7 +147,8 @@ def detect_install() -> Install:
     pipx venv means pipx, an editable install points back at a source checkout.
     """
     if getattr(sys, "frozen", False):
-        return Install(kind="binary", location=str(Path(sys.executable).resolve()))
+        executable = Path(sys.executable).resolve()
+        return Install(kind="binary", location=str(executable), bin_dir=str(executable.parent))
 
     module = Path(__file__).resolve()
     location = str(module.parent)
@@ -477,6 +483,19 @@ def inspect_source(
 # ----------------------------------------------------------------------
 # Installing
 # ----------------------------------------------------------------------
+@contextlib.contextmanager
+def _environment(environment: dict[str, str]):  # noqa: ANN201
+    """Set the environment an upgrade command inherits, then put it back."""
+    previous = dict(os.environ)
+    os.environ.clear()
+    os.environ.update(environment)
+    try:
+        yield
+    finally:
+        os.environ.clear()
+        os.environ.update(previous)
+
+
 def _run(command: list[str], timeout: float = 600.0) -> subprocess.CompletedProcess[str]:
     """Run an upgrade command. The argument list is built here, never by a user."""
     return subprocess.run(  # noqa: S603 - fixed argv, no shell
@@ -486,6 +505,18 @@ def _run(command: list[str], timeout: float = 600.0) -> subprocess.CompletedProc
         timeout=timeout,
         check=False,
     )
+
+
+def pipx_command() -> list[str]:
+    """How to start pipx.
+
+    Through this interpreter when it is installed here, because the ``pipx`` on
+    PATH may belong to a different Python than the one running the app it is
+    about to upgrade.
+    """
+    if importlib.util.find_spec("pipx") is not None:
+        return [sys.executable, "-m", "pipx"]
+    return ["pipx"]
 
 
 def upgrade_command(install: Install, *, beta: bool | None = None) -> list[str]:
@@ -504,8 +535,8 @@ def upgrade_command(install: Install, *, beta: bool | None = None) -> list[str]:
         return [sys.executable, "-m", "pip", "install", "--upgrade", "jaigent"]
     if install.kind == "pipx":
         if use_beta:
-            return ["pipx", "install", "--force", f"git+{REPO_URL}.git@{BETA_BRANCH}"]
-        return ["pipx", "upgrade", "jaigent"]
+            return [*pipx_command(), "install", "--force", f"git+{REPO_URL}.git@{BETA_BRANCH}"]
+        return [*pipx_command(), "upgrade", "jaigent"]
     if install.kind == "binary":
         if platform.system() == "Windows":
             return [
@@ -575,11 +606,24 @@ def perform_update(install: Install | None = None, *, beta: bool | None = None) 
 
     command = upgrade_command(install, beta=use_beta)
 
+    # Both installers take JAIGENT_BIN_DIR. Without it a binary update installs
+    # to their default (~/.local/bin, %LOCALAPPDATA%) which is not necessarily
+    # the directory this binary came from — the update would "succeed" and the
+    # shell would keep running the old file.
+    environment = dict(os.environ)
+    if install.kind == "binary" and install.bin_dir:
+        environment["JAIGENT_BIN_DIR"] = install.bin_dir
+
     try:
-        completed = _run(command)
+        with _environment(environment):
+            completed = _run(command)
     except FileNotFoundError as exc:
         if install.kind == "source":
             completed = _run([sys.executable, "-m", "pip", "install", "--upgrade", "jaigent"])
+        elif install.kind == "pipx" and command[:1] == [sys.executable]:
+            # pipx is not importable here after all; try the one on PATH.
+            with _environment(environment):
+                completed = _run(["pipx", *command[3:]])
         else:
             raise UpdateError(f"Could not run {command[0]!r}: {exc}") from exc
     except subprocess.TimeoutExpired as exc:
@@ -601,11 +645,12 @@ def perform_update(install: Install | None = None, *, beta: bool | None = None) 
     # came from a git URL is refused outright, and so is an app that is not on
     # PyPI yet. Reinstalling in place is the same outcome the user asked for.
     if completed.returncode != 0 and install.kind == "pipx":
-        completed = _run(["pipx", "install", "--force", "jaigent"])
+        pipx = pipx_command()
+        completed = _run([*pipx, "install", "--force", "jaigent"])
         if completed.returncode != 0:
             completed = _run(
                 [
-                    "pipx",
+                    *pipx,
                     "install",
                     "--force",
                     f"git+{REPO_URL}.git@{BETA_BRANCH}" if use_beta else f"git+{REPO_URL}.git",
@@ -633,18 +678,22 @@ def perform_update(install: Install | None = None, *, beta: bool | None = None) 
 
     output = (completed.stdout or "").strip()
 
-    # A source checkout that only `git pull`s still runs the old bytecode
-    # until the editable install is refreshed.
+    # A source checkout that only `git pull`s still runs the old bytecode until
+    # the editable install is refreshed, so a failed refresh is a failed update:
+    # the tree is new and the import is old, which is worse than either on its
+    # own and used to be reported as "Updated successfully".
     if install.kind == "source":
         root = find_source_root(Path(install.location) if install.location else None)
         if root is not None:
-            try:
-                reinstall = _run([sys.executable, "-m", "pip", "install", "-e", str(root)])
-            except (FileNotFoundError, subprocess.TimeoutExpired):
-                pass
-            else:
-                if reinstall.returncode == 0 and reinstall.stdout:
-                    output = f"{output}\n{(reinstall.stdout or '').strip()}".strip()
+            reinstall = _run([sys.executable, "-m", "pip", "install", "-e", str(root)])
+            if reinstall.returncode != 0:
+                detail = (reinstall.stderr or reinstall.stdout or "").strip()
+                raise UpdateError(
+                    "The checkout is updated but `pip install -e .` failed, so Python is "
+                    f"still importing the old code:\n{detail[-800:]}"
+                )
+            if reinstall.stdout:
+                output = f"{output}\n{(reinstall.stdout or '').strip()}".strip()
 
     return output
 
