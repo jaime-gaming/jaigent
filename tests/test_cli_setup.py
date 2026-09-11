@@ -179,7 +179,12 @@ class TestUpdateCommand:
 
         seen: dict[str, object] = {}
 
-        def fake_fetch(timeout: float = 15.0, *, beta: bool | None = None) -> FetchResult:
+        def fake_fetch(
+            timeout: float = 15.0,
+            *,
+            beta: bool | None = None,
+            require_assets: bool = False,
+        ) -> FetchResult:
             seen["beta"] = beta
             return FetchResult(
                 release=Release(version="99.0.0", url="u", prerelease=True),
@@ -407,6 +412,29 @@ class TestUpdateCommand:
         assert cli.main(["update", "--check", "--beta", "--no-color"]) == 0
         assert seen.get("branch") == "beta"
         assert "up to date" in capsys.readouterr().out.lower()
+
+    def test_a_binary_beta_check_ignores_assetless_prereleases(
+        self, home: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+    ) -> None:
+        """A binary update installs a release's assets; a pre-release that
+        published none (a build that failed) is not an update target."""
+        from jaigent.updater import FetchResult, Install, SourceSync
+
+        seen: dict[str, object] = {}
+
+        def fake_fetch(**kwargs):  # noqa: ANN003, ANN202
+            seen.update(kwargs)
+            return FetchResult(release=None, reason="no-releases")
+
+        monkeypatch.setattr("jaigent.updater.fetch_latest_detailed", fake_fetch)
+        monkeypatch.setattr("jaigent.updater.inspect_source", lambda **k: SourceSync())
+        monkeypatch.setattr(
+            "jaigent.updater.detect_install",
+            lambda: Install(kind="binary", location="/x/jaigent", bin_dir="/x"),
+        )
+
+        assert cli.main(["update", "--check", "--beta", "--no-color"]) == 1
+        assert seen.get("require_assets") is True
 
     def test_an_ahead_checkout_is_not_offered_a_useless_pull(
         self, home: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture

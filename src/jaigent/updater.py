@@ -186,6 +186,10 @@ class Release:
     #: True when GitHub flags it a pre-release. Only ever set on the beta
     #: channel: stable reads `/latest`, which excludes pre-releases.
     prerelease: bool = False
+    #: The names of the attached release assets. A pre-release whose build
+    #: failed ships with none, and a binary update aimed at it can only fail
+    #: with "download failed" — so binary installs skip it until it has some.
+    assets: tuple[str, ...] = ()
 
     @property
     def is_newer(self) -> bool:
@@ -257,12 +261,23 @@ def _release_from(data: dict[str, Any]) -> Release | None:
     tag = str(raw).strip() if raw is not None else ""
     if not tag:
         return None
+    raw_assets = data.get("assets")
+    assets = (
+        tuple(
+            str(asset.get("name"))
+            for asset in raw_assets
+            if isinstance(asset, dict) and asset.get("name")
+        )
+        if isinstance(raw_assets, list)
+        else ()
+    )
     return Release(
         version=tag.lstrip("vV"),
         url=str(data.get("html_url") or f"https://github.com/{REPO}/releases"),
         notes=str(data.get("body") or ""),
         published=str(data.get("published_at") or ""),
         prerelease=bool(data.get("prerelease")),
+        assets=assets,
     )
 
 
@@ -282,7 +297,10 @@ def _classify_fetch_error(exc: Exception) -> FetchResult:
 
 
 def fetch_latest_detailed(
-    timeout: float = FETCH_TIMEOUT, *, beta: bool | None = None
+    timeout: float = FETCH_TIMEOUT,
+    *,
+    beta: bool | None = None,
+    require_assets: bool = False,
 ) -> FetchResult:
     """Ask GitHub for the newest release, explaining failures instead of hiding them.
 
@@ -293,10 +311,14 @@ def fetch_latest_detailed(
     On the beta channel this includes pre-releases (``/latest`` hides them,
     so a list is read instead and drafts skipped). The stable channel stays
     on ``/latest`` and can never be offered a beta.
+
+    With ``require_assets`` (a standalone-binary update), pre-releases that
+    published no binaries are skipped: aiming at one can only end in a
+    "download failed" from the installer.
     """
     use_beta = beta_enabled() if beta is None else beta
     if use_beta:
-        return _fetch_newest_including_prereleases(timeout)
+        return _fetch_newest_including_prereleases(timeout, require_assets=require_assets)
 
     try:
         response = _github_get(RELEASES_URL, timeout=timeout)
@@ -313,8 +335,14 @@ def fetch_latest_detailed(
     return FetchResult(release=release, reason="ok")
 
 
-def _fetch_newest_including_prereleases(timeout: float) -> FetchResult:
-    """The newest published release, pre-releases included. Never raises."""
+def _fetch_newest_including_prereleases(
+    timeout: float, *, require_assets: bool = False
+) -> FetchResult:
+    """The newest published release, pre-releases included. Never raises.
+
+    With ``require_assets``, releases that published no assets are skipped —
+    a binary update pinned to one of them would fail at the download step.
+    """
     try:
         response = _github_get(RELEASES_LIST_URL, timeout=timeout)
         response.raise_for_status()
@@ -328,19 +356,27 @@ def _fetch_newest_including_prereleases(timeout: float) -> FetchResult:
         if not isinstance(item, dict) or item.get("draft"):
             continue
         release = _release_from(item)
-        if release is not None:
-            return FetchResult(release=release, reason="ok")
+        if release is None:
+            continue
+        if require_assets and not release.assets:
+            continue
+        return FetchResult(release=release, reason="ok")
     return FetchResult(reason="no-releases")
 
 
-def fetch_latest(timeout: float = FETCH_TIMEOUT, *, beta: bool | None = None) -> Release | None:
+def fetch_latest(
+    timeout: float = FETCH_TIMEOUT,
+    *,
+    beta: bool | None = None,
+    require_assets: bool = False,
+) -> Release | None:
     """Ask GitHub for the newest release, or ``None`` if that fails.
 
     Every failure mode — offline, DNS, rate limit, malformed JSON, no releases
     yet — returns ``None`` rather than raising. A version check is never
     important enough to interrupt what the user was doing.
     """
-    return fetch_latest_detailed(timeout=timeout, beta=beta).release
+    return fetch_latest_detailed(timeout=timeout, beta=beta, require_assets=require_assets).release
 
 
 # ----------------------------------------------------------------------
@@ -818,12 +854,18 @@ def upgrade_command(install: Install, *, beta: bool | None = None) -> list[str]:
     use_beta = beta_enabled() if beta is None else beta
     if install.kind == "pip":
         if use_beta:
+            # --force-reinstall, because the beta branch gains commits without
+            # version bumps: once the installed version matches the branch's,
+            # a plain --upgrade decides the requirement is already satisfied
+            # and quietly installs nothing. Forcing matches what the pipx
+            # branch below does with `install --force`.
             return [
                 sys.executable,
                 "-m",
                 "pip",
                 "install",
                 "--upgrade",
+                "--force-reinstall",
                 f"git+{REPO_URL}.git@{BETA_BRANCH}",
             ]
         return [sys.executable, "-m", "pip", "install", "--upgrade", "jaigent"]
@@ -1033,7 +1075,12 @@ def perform_update(
         raise UpdateError("The upgrade timed out.") from exc
 
     try:
-        if completed.returncode != 0 and install.kind == "pip":
+        # A retry is only meaningful on the stable channel, where the first
+        # attempt was the PyPI name: jaigent may not be published there yet,
+        # and the git URL is the fallback. On beta the primary command already
+        # *is* the beta branch's git URL, so re-running it (or worse, the PyPI
+        # name, which would install stable) changes nothing.
+        if completed.returncode != 0 and install.kind == "pip" and not use_beta:
             completed = _run(
                 [
                     sys.executable,
@@ -1041,29 +1088,18 @@ def perform_update(
                     "pip",
                     "install",
                     "--upgrade",
-                    f"git+{REPO_URL}.git@{BETA_BRANCH}" if use_beta else f"git+{REPO_URL}.git",
+                    f"git+{REPO_URL}.git",
                 ]
             )
 
         # `pipx upgrade` only works for an app installed from a registry; one that
         # came from a git URL is refused outright, and so is an app that is not on
         # PyPI yet. Reinstalling in place is the same outcome the user asked for.
-        if completed.returncode != 0 and install.kind == "pipx":
+        if completed.returncode != 0 and install.kind == "pipx" and not use_beta:
             pipx = pipx_command()
             completed = _run([*pipx, "install", "--force", "jaigent"])
             if completed.returncode != 0:
-                completed = _run(
-                    [
-                        *pipx,
-                        "install",
-                        "--force",
-                        (
-                            f"git+{REPO_URL}.git@{BETA_BRANCH}"
-                            if use_beta
-                            else f"git+{REPO_URL}.git"
-                        ),
-                    ]
-                )
+                completed = _run([*pipx, "install", "--force", f"git+{REPO_URL}.git"])
     except FileNotFoundError as exc:
         # A pipx install whose `pipx` left the PATH used to end in a traceback
         # here; the first command was guarded, the fallbacks were not.

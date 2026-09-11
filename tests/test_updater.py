@@ -129,6 +129,68 @@ def test_beta_pip_installs_from_the_beta_branch() -> None:
     assert command[-1].endswith("@beta")
 
 
+def test_beta_pip_forces_a_reinstall() -> None:
+    """The beta branch gains commits without version bumps.
+
+    Once the installed version matches the branch's, a plain ``--upgrade``
+    decides the requirement is already satisfied and installs nothing — which
+    is exactly how ``update --beta`` used to "finish" without downloading the
+    beta. Forcing the reinstall matches what the pipx beta path does.
+    """
+    command = upgrade_command(Install(kind="pip", location="x"), beta=True)
+    assert "--force-reinstall" in command
+
+
+def test_stable_pip_does_not_force_a_reinstall() -> None:
+    """Stable only moves on releases, so a same-version skip is correct there."""
+    command = upgrade_command(Install(kind="pip", location="x"), beta=False)
+    assert "--force-reinstall" not in command
+    assert command[-1] == "jaigent"
+
+
+def test_beta_pip_update_never_reaches_for_the_pypi_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Beta installs from the branch; the PyPI name is the stable channel's."""
+    seen: list[list[str]] = []
+
+    def fake_run(command: list[str], timeout: float = 600.0) -> subprocess.CompletedProcess[str]:
+        seen.append(command)
+        return subprocess.CompletedProcess(command, 1, "", "failed")
+
+    monkeypatch.setattr(updater, "_run", fake_run)
+
+    with pytest.raises(UpdateError):
+        updater.perform_update(Install(kind="pip", location="x"), beta=True)
+
+    assert seen, "the beta upgrade ran nothing"
+    for command in seen:
+        assert command[-1].endswith("@beta"), command
+        assert "jaigent" not in command
+
+
+def test_beta_pipx_update_never_reaches_for_the_pypi_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The old fallback tried ``pipx install --force jaigent`` — PyPI — even
+    on the beta channel, while jaigent is not published there yet."""
+    seen: list[list[str]] = []
+
+    def fake_run(command: list[str], timeout: float = 600.0) -> subprocess.CompletedProcess[str]:
+        seen.append(command)
+        return subprocess.CompletedProcess(command, 1, "", "failed")
+
+    monkeypatch.setattr(updater, "_run", fake_run)
+
+    with pytest.raises(UpdateError):
+        updater.perform_update(Install(kind="pipx", location="x"), beta=True)
+
+    assert seen, "the beta upgrade ran nothing"
+    for command in seen:
+        assert command[-1].endswith("@beta"), command
+        assert "jaigent" not in command
+
+
 def test_beta_source_fetches_the_beta_branch(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -1322,6 +1384,82 @@ def test_beta_skips_drafts(monkeypatch: pytest.MonkeyPatch) -> None:
 
     assert release is not None
     assert release.version == "0.5.5"
+
+
+def test_release_assets_are_read(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        httpx,
+        "get",
+        fake_list_response(
+            [
+                {
+                    "tag_name": "v0.5.6",
+                    "prerelease": True,
+                    "assets": [{"name": "jaigent-linux-x64.tar.gz"}],
+                }
+            ]
+        ),
+    )
+
+    release = updater.fetch_latest(beta=True)
+
+    assert release is not None
+    assert release.assets == ("jaigent-linux-x64.tar.gz",)
+
+
+def test_beta_keeps_an_assetless_prerelease_for_pip(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A pip or pipx update follows the branch, so assets are irrelevant."""
+    monkeypatch.setattr(
+        httpx,
+        "get",
+        fake_list_response([{"tag_name": "v0.5.6", "prerelease": True, "assets": []}]),
+    )
+
+    release = updater.fetch_latest(beta=True)
+
+    assert release is not None
+    assert release.version == "0.5.6"
+
+
+def test_binary_beta_skips_a_prerelease_without_assets(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A binary update installs a release's assets. A pre-release whose build
+    failed ships with none, and an update pinned to it can only end in a
+    "download failed" from the installer — so it is skipped until it has
+    binaries."""
+    monkeypatch.setattr(
+        httpx,
+        "get",
+        fake_list_response(
+            [
+                {"tag_name": "v0.5.6", "prerelease": True, "assets": []},
+                {
+                    "tag_name": "v0.5.5",
+                    "prerelease": False,
+                    "assets": [{"name": "jaigent-linux-x64.tar.gz"}],
+                },
+            ]
+        ),
+    )
+
+    release = updater.fetch_latest(beta=True, require_assets=True)
+
+    assert release is not None
+    assert release.version == "0.5.5"
+
+
+def test_binary_beta_with_only_assetless_releases_reports_none(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        httpx,
+        "get",
+        fake_list_response([{"tag_name": "v0.5.6", "prerelease": True, "assets": []}]),
+    )
+
+    assert updater.fetch_latest(beta=True, require_assets=True) is None
+    assert updater.fetch_latest_detailed(beta=True, require_assets=True).reason == "no-releases"
 
 
 def test_beta_with_no_published_release_returns_none(

@@ -778,6 +778,7 @@ def run_turn(agent: Agent, settings: Settings, prompt: str, *, plain: bool) -> A
     # before the live answer streams, so the input remains visible.
     if not plain:
         from rich.panel import Panel
+
         console.print()
         console.print(
             Panel(
@@ -3217,6 +3218,7 @@ def cmd_feedback(args: argparse.Namespace) -> int:
     full_message = message
     if debug:
         import platform
+
         debug_block = (
             "\n\n--- Debug context ---\n"
             f"- jaigent {__version__}\n"
@@ -3241,7 +3243,9 @@ def cmd_feedback(args: argparse.Namespace) -> int:
     else:
         console.print(f"[{MUTED}]Send it from here:[/]")
     console.print(Text(delivery.url))
-    console.print(f"[{MUTED}]Category: {fb_type} · Rating: {rating}/5 · Use --debug for more info[/]")
+    console.print(
+        f"[{MUTED}]Category: {fb_type} · Rating: {rating}/5 · Use --debug for more info[/]"
+    )
     return 0
 
 
@@ -3268,7 +3272,12 @@ def cmd_update(args: argparse.Namespace) -> int:
         )
 
     with console.status("Checking GitHub...", spinner="dots") if not plain else nullcontext():
-        fetched = updater.fetch_latest_detailed(beta=use_beta)
+        # A binary update installs a release's assets, so a pre-release that
+        # published none is not an update target — aiming at it ends in a
+        # "download failed" from the installer.
+        fetched = updater.fetch_latest_detailed(
+            beta=use_beta, require_assets=install.kind == "binary"
+        )
         # The source check must compare against the same channel the update
         # would install — comparing a beta checkout against main always
         # reports "not synced" and offers a useless pull.
@@ -3467,7 +3476,10 @@ def cmd_update(args: argparse.Namespace) -> int:
     # thing worth knowing while the package is not on PyPI.
     if install.kind in {"pip", "pipx"}:
         details.append("If jaigent is not on PyPI yet, pip has nothing newer to install:")
-        details.append(f"[cyan]pip install --upgrade git+{updater.REPO_URL}.git[/]")
+        git_url = f"git+{updater.REPO_URL}.git"
+        if use_beta:
+            git_url = f"{git_url}@{updater.BETA_BRANCH}"
+        details.append(f"[cyan]pip install --upgrade {git_url}[/]")
 
     err_console.print(
         "\n[yellow]The upgrade command finished, but nothing changed:[/]\n  "

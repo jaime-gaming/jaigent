@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`jaigent update --beta` downloads the beta again.** The 0.5.6 bump
+  changed `__version__` but not `pyproject.toml`, so the beta branch built
+  as 0.5.5: pip compared versions, found nothing newer, installed nothing,
+  and the failure pointed at PyPI. The versions agree again, the pip beta
+  upgrade now uses `--force-reinstall` (beta gains commits without version
+  bumps, which a plain `--upgrade` skips), and the beta channel's failure
+  fallbacks no longer reach for the PyPI name — they stay on the branch.
+- **Binary beta updates skip pre-releases that published no binaries.** A
+  pre-release whose build failed ships with no assets, and an update pinned
+  to it can only end in "download failed"; the newest release *with*
+  binaries is the target now.
+
 ## [0.5.6] - 2026-09-11
 
 ### Added

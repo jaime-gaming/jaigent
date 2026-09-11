@@ -63,10 +63,11 @@ def issue_url(message: str, feedback_type: str = "other", rating: str = "5") -> 
     text = str(message or "").strip()
     if len(text) > _MAX_FORM_BODY:
         text = text[:_MAX_FORM_BODY].rstrip() + "\n\n[truncated to fit the URL]"
+    body = f"**Type:** {feedback_type} | **Rating:** {rating}/5\n\n{text}\n\n---\n"
     query = urllib.parse.urlencode(
         {
             "title": issue_title(message, feedback_type),
-            "body": f"**Type:** {feedback_type} | **Rating:** {rating}/5\n\n{text}\n\n---\n{environment_footer()}\n",
+            "body": f"{body}{environment_footer()}\n",
         }
     )
     return f"{ISSUES_URL}?{query}"
